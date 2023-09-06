@@ -269,6 +269,44 @@ class LinearNF4(Linear4bit):
     def __init__(self, input_features, output_features, bias=True, compute_dtype=None, compress_statistics=True,device=None):
         super().__init__(input_features, output_features, bias, compute_dtype, compress_statistics, 'nf4', device)
 
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        """fill state_dict with components of nf4 """
+        # super()._save_to_state_dict(destination, prefix, keep_vars)  # skip for there is no 'weight'
+
+        def update_sd(*args, **kwargs):
+            for key, value in kwargs.items():
+                key_name = prefix + '.' + key
+                destination[key_name] = value if keep_vars or not isinstance(value, torch.Tensor) else value.detach()
+
+        update_sd(
+            data=self.data,
+            absmax=self.quant_state[0],
+            shape=self.quant_state[1],
+            dtype=self.quant_state[2],
+            blocksize=self.quant_state[3],
+            nested=self.quant_state[4],
+            quant_type=self.quant_state[5],
+            datatype=self.quant_state[6],   # normal scale from F.get_4bit_type('nf4')
+        )
+        
+        nested = self.quant_state[4]
+        if nested:
+            nested_stats = self.quant_state[4][1]
+            update_sd(
+                nested_offset=self.quant_state[4][0],
+                nested_absmax=nested_stats[0],
+                nested_code=nested_stats[1],
+                nested_blocksize=nested_stats[2],    
+                nested_dtype=nested_stats[4],
+            )                                                                    
+            assert (nested_stats[3] == False)  # no level-3 nesting 
+            assert (nested_stats[5] is None)
+            assert (nested_stats[6] is None)
+
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        raise NotImplementedError
 
 
 class Int8Params(torch.nn.Parameter):
