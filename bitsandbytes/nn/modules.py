@@ -141,9 +141,31 @@ class Embedding(torch.nn.Embedding):
 
 class Params4bit(torch.nn.Parameter):
 
+    def __new__(cls, data=None, requires_grad=True, quant_state=None, blocksize=64, compress_statistics=True, quant_type='fp4'):
+        if data is None:
+            data = torch.empty(0)
+
+        self = torch.Tensor._make_subclass(cls, data, requires_grad)
+        self.blocksize = blocksize
+        self.compress_statistics = compress_statistics
+        self.quant_type = quant_type
+        self.quant_state = quant_state
+        self.data = data
+        return self
+    
+    @classmethod
+    def from_prequantized(cls, data, quantized_stats, requires_grad=False, device='cuda', **kwargs):        
+        self = torch.Tensor._make_subclass(cls, data.to(device), requires_grad)
+        # assert self.dtype == data.dtype
+        self.quant_state = self.get_quant_state_from_kwargs(quantized_stats, device=device)
+        self.blocksize = self.quant_state[3]
+        self.compress_statistics = self.quant_state[4] is not None
+        self.quant_type = self.quant_state[5] 
+        return self
+
     @staticmethod
     def get_quant_state_from_kwargs(kwargs, device):
-        # TODO: refactor this. This is a nightmare
+        # TODO: refactor this. This is a nightmare. Indeed.
         # for 4-bit: 
         # state = [qabsmax, input_shape, A.dtype, blocksize, [offset, state2], quant_type]
         # state2 = [absmax, input_shape, A.dtype, blocksize, None, quant_type]
@@ -171,7 +193,7 @@ class Params4bit(torch.nn.Parameter):
                 None,
                 None,
             ]
-            nested_stuff = offset, state2
+            nested_stuff = [offset, state2]
 
         state = [ \
             kwargs['absmax'].to(device), 
@@ -183,28 +205,6 @@ class Params4bit(torch.nn.Parameter):
             kwargs['datatype'].to(device), 
             ]
         return state
-
-    @classmethod
-    def from_prequantized(cls, data, quantized_stats, requires_grad=False, device='cuda', **kwargs):        
-        self = torch.Tensor._make_subclass(cls, data, requires_grad).to(device)
-        assert self.dtype == data.dtype
-        self.quant_state = self.get_quant_state_from_kwargs(quantized_stats, device=device)
-        self.blocksize = self.quant_state[3]
-        self.compress_statistics = self.quant_state[4] is not None
-        self.quant_type = self.quant_state[5] 
-        return self
-
-    def __new__(cls, data=None, requires_grad=True, quant_state=None, blocksize=64, compress_statistics=True, quant_type='fp4'):
-        if data is None:
-            data = torch.empty(0)
-
-        self = torch.Tensor._make_subclass(cls, data, requires_grad)
-        self.blocksize = blocksize
-        self.compress_statistics = compress_statistics
-        self.quant_type = quant_type
-        self.quant_state = quant_state
-        self.data = data
-        return self
 
     def cuda(self, device):
         w = self.data.contiguous().half().cuda(device)
@@ -237,10 +237,10 @@ class Params4bit(torch.nn.Parameter):
                 # make sure the quantization state is on the right device
                 s[0] = s[0].to(device)
                 if self.compress_statistics:
-                    # TODO: refactor this. This is a nightmare
+                    # TODO: refactor this. This is a nightmare. Indeed.
                     # for 4-bit: 
-                    # state = [qabsmax, input_shape, A.dtype, blocksize, [offset, state2], quant_type]
-                    # state2 = [absmax, input_shape, A.dtype, blocksize, None, quant_type]
+                    # state = [qabsmax, input_shape, A.dtype, blocksize, [offset, state2], quant_type, datatype]
+                    # state2 = [absmax, input_shape, A.dtype, blocksize, None, quant_type, datatype]
                     #s[-2][0] = s[-2][0].to(device) # offset
                     #s[-2][1][0] = s[-2][1][0].to(device) # nested absmax
 
