@@ -197,7 +197,7 @@ class Params4bit(torch.nn.Parameter):
 
         state = [ \
             kwargs['absmax'].to(device), 
-            kwargs['shape'],   # consired converting tensor -> tuple
+            torch.Size(kwargs['shape']),   # consired converting tensor -> tuple
             getattr(torch, tensor2str(kwargs['dtype'])),
             kwargs['blocksize'].item(),
             nested_stuff,
