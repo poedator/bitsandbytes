@@ -140,6 +140,60 @@ class Embedding(torch.nn.Embedding):
         return emb
 
 class Params4bit(torch.nn.Parameter):
+
+    @staticmethod
+    def get_quant_state_from_kwargs(kwargs, device):
+        # TODO: refactor this. This is a nightmare
+        # for 4-bit: 
+        # state = [qabsmax, input_shape, A.dtype, blocksize, [offset, state2], quant_type]
+        # state2 = [absmax, input_shape, A.dtype, blocksize, None, quant_type]
+        #s[-2][0] = s[-2][0].to(device) # offset
+        #s[-2][1][0] = s[-2][1][0].to(device) # nested absmax
+
+        # state = [qabsmax, input_shape, A.dtype, blocksize, [offset, state2], quant_type, datatype]
+        # state2= [absmax, input_shape, A.dtype, blocksize, None, quant_type, datatype]
+
+        tensor2str = lambda xx: ''.join([chr(x) for x in xx]).strip('.')
+
+        kwargs = {k.split('.')[-1] :v for k, v in kwargs.items()}
+        
+        is_nested = kwargs['nested'].item() 
+        nested_stuff = None
+
+        if is_nested:
+            offset = kwargs['nested_offset']
+            state2 = [ \
+                kwargs['nested_absmax'].to(device),
+                kwargs['nested_code'].to(device),
+                kwargs['nested_blocksize'].item(),
+                False,
+                getattr(torch, tensor2str(kwargs['nested_dtype'])),
+                None,
+                None,
+            ]
+            nested_stuff = offset, state2
+
+        state = [ \
+            kwargs['absmax'].to(device), 
+            kwargs['shape'],   # consired converting tensor -> tuple
+            getattr(torch, tensor2str(kwargs['dtype'])),
+            kwargs['blocksize'].item(),
+            nested_stuff,
+            tensor2str(kwargs['quant_type']),
+            kwargs['datatype'].to(device), 
+            ]
+        return state
+
+    @classmethod
+    def from_prequantized(cls, data, quantized_stats, requires_grad=False, device='cuda', **kwargs):        
+        self = torch.Tensor._make_subclass(cls, data, requires_grad).to(device)
+        assert self.dtype == data.dtype
+        self.quant_state = self.get_quant_state_from_kwargs(quantized_stats, device=device)
+        self.blocksize = self.quant_state[3]
+        self.compress_statistics = self.quant_state[4] is not None
+        self.quant_type = self.quant_state[5] 
+        return self
+
     def __new__(cls, data=None, requires_grad=True, quant_state=None, blocksize=64, compress_statistics=True, quant_type='fp4'):
         if data is None:
             data = torch.empty(0)
@@ -225,9 +279,89 @@ class Linear4bit(nn.Linear):
                 warnings.filterwarnings('ignore', message='.*inference or training')
 
 
+    def _update_buffers(self):
+        
+        def string_to_tensor(s):
+            """stores string as ints for serialization. assumes codes fit int16"""
+            return torch.tensor([ord(x) for x in s], dtype=torch.int16)
+        
+        if getattr(self.weight, 'quant_state', None) is not None:
+            weight_quant_state = self.weight.quant_state
+            self.register_buffer('absmax', weight_quant_state[0])
+            self.register_buffer('shape', torch.tensor(weight_quant_state[1]))
+            self.register_buffer('dtype', string_to_tensor(str(weight_quant_state[2]).strip('torch')))
+            self.register_buffer('blocksize', torch.tensor(weight_quant_state[3]))
+            self.register_buffer('nested', torch.tensor(weight_quant_state[4] is not None))
+            self.register_buffer('quant_type', string_to_tensor(weight_quant_state[5]))
+            self.register_buffer('datatype', weight_quant_state[6])   # normal scale from F.get_4bit_type('nf4')
+                        
+            nested = weight_quant_state[4]
+            if nested:
+                nested_stats = weight_quant_state[4][1]
+                self.register_buffer('nested_offset', weight_quant_state[4][0])
+                self.register_buffer('nested_absmax', nested_stats[0])
+                self.register_buffer('nested_code', nested_stats[1])
+                self.register_buffer('nested_blocksize', torch.tensor(nested_stats[2]))
+                self.register_buffer('nested_dtype', string_to_tensor(str(nested_stats[4]).strip('torch')))
 
 
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        """
+        fill state_dict with components of nf4 
+        TODO: test with other 4-bit Q-types
+        """
+        self._update_buffers()
 
+        super()._save_to_state_dict(destination, prefix, keep_vars)  # saving weight and bias
+        return
+
+        def update_sd(*args, **kwargs):
+            for key, value in kwargs.items():
+                destination[prefix + key] = value if keep_vars or not isinstance(value, torch.Tensor) else value.detach()
+
+        def string_to_tensor(s):
+            """stores string as ints for serialization. assumes codes fit int16"""
+            return torch.tensor([ord(x) for x in s], dtype=torch.int16)
+        
+        weight_quant_state = self.weight.quant_state
+
+        if weight_quant_state is not None:
+            update_sd(
+                # weight_data=self.weight.data,
+                # bias_data=self.bias.data,
+                absmax=weight_quant_state[0],
+                shape=torch.tensor(weight_quant_state[1]),
+                dtype=string_to_tensor(str(weight_quant_state[2]).strip('torch')),
+                blocksize=torch.tensor(weight_quant_state[3]), 
+                nested=torch.tensor(weight_quant_state[4] is not None),
+                quant_type=string_to_tensor(weight_quant_state[5]),
+                datatype=weight_quant_state[6],   # normal scale from F.get_4bit_type('nf4')
+            )
+            
+            nested = weight_quant_state[4]
+            if nested:
+                nested_stats = weight_quant_state[4][1]
+                update_sd(
+                    nested_offset=weight_quant_state[4][0],
+                    nested_absmax=nested_stats[0],
+                    nested_code=nested_stats[1],
+                    nested_blocksize=torch.tensor(nested_stats[2]),    
+                    nested_dtype=string_to_tensor(str(nested_stats[4]).strip('torch')),
+                )                                                                    
+                assert (nested_stats[3] == False)  # no level-3 nesting 
+                assert (nested_stats[5] is None)
+                assert (nested_stats[6] is None)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
+                                      error_msgs)
+        unexpected_copy = list(unexpected_keys)
+
+        for key in unexpected_copy:
+            print(key)
+
+        raise NotImplementedError
 
     def forward(self, x: torch.Tensor):
         # weights are cast automatically as Int8Params, but the bias has to be cast manually
@@ -268,45 +402,6 @@ class LinearNF4(Linear4bit):
     '''
     def __init__(self, input_features, output_features, bias=True, compute_dtype=None, compress_statistics=True,device=None):
         super().__init__(input_features, output_features, bias, compute_dtype, compress_statistics, 'nf4', device)
-
-    def _save_to_state_dict(self, destination, prefix, keep_vars):
-        """fill state_dict with components of nf4 """
-        # super()._save_to_state_dict(destination, prefix, keep_vars)  # skip for there is no 'weight'
-
-        def update_sd(*args, **kwargs):
-            for key, value in kwargs.items():
-                key_name = prefix + '.' + key
-                destination[key_name] = value if keep_vars or not isinstance(value, torch.Tensor) else value.detach()
-
-        update_sd(
-            data=self.data,
-            absmax=self.quant_state[0],
-            shape=self.quant_state[1],
-            dtype=self.quant_state[2],
-            blocksize=self.quant_state[3],
-            nested=self.quant_state[4],
-            quant_type=self.quant_state[5],
-            datatype=self.quant_state[6],   # normal scale from F.get_4bit_type('nf4')
-        )
-        
-        nested = self.quant_state[4]
-        if nested:
-            nested_stats = self.quant_state[4][1]
-            update_sd(
-                nested_offset=self.quant_state[4][0],
-                nested_absmax=nested_stats[0],
-                nested_code=nested_stats[1],
-                nested_blocksize=nested_stats[2],    
-                nested_dtype=nested_stats[4],
-            )                                                                    
-            assert (nested_stats[3] == False)  # no level-3 nesting 
-            assert (nested_stats[5] is None)
-            assert (nested_stats[6] is None)
-
-
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
-                              missing_keys, unexpected_keys, error_msgs):
-        raise NotImplementedError
 
 
 class Int8Params(torch.nn.Parameter):
